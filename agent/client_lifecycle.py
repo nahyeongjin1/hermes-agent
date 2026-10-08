@@ -64,6 +64,28 @@ def _valid_credential_pair(api_key: Any, base_url: Any) -> bool:
     return bool(isinstance(api_key, str) and api_key.strip() and isinstance(base_url, str) and base_url.strip())
 
 
+def _move_main_key_holders(agent, old_key: Any, old_base: Any) -> None:
+    """After a same-route credential change, move every holder still carrying the old main key.
+
+    The compressor sends its key as the aux ``main_runtime`` and same-turn ``auto`` aux calls read the
+    published runtime; left on a rotated-out key, compression 401s for the rest of the session.
+    Identity-matched, so a compressor on its own route keeps its credential.
+    """
+    new_key = agent.api_key
+    if not old_key or new_key == old_key:
+        return
+    cc = getattr(agent, "context_compressor", None)
+    if cc is not None and getattr(cc, "api_key", None) == old_key:
+        cc.api_key = new_key
+        if getattr(cc, "base_url", None) == old_base and agent.base_url != old_base:
+            cc.base_url = agent.base_url
+            if hasattr(cc, "_aux_context_ceiling"):  # probed against the old route, as update_model resets it
+                cc._aux_context_ceiling = None
+    if agent.base_url == old_base:  # the published runtime's base_url is not rewritten here
+        from agent.auxiliary_key_rotation import rotate_runtime_main_api_key
+        rotate_runtime_main_api_key(old_key, new_key)
+
+
 def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb_base_url: str, fb_api_mode: str) -> None:
     """Install the fallback client(s) in place, honoring request_timeout_seconds (None = SDK default)."""
     timeout = get_provider_request_timeout(fb_provider, fb_model)
@@ -563,8 +585,10 @@ class ClientLifecycleMixin:
 
     def _adopt_openai_credentials(self, api_key: str, base_url: str, *, reason: str) -> bool:
         """Apply a fresh key/base_url to the OpenAI-style kwargs and rebuild the shared client."""
+        old_key, old_base = self.api_key, self.base_url
         self.api_key, self.base_url = api_key.strip(), base_url.strip().rstrip("/")
         self._sync_client_kwargs_credentials()
+        _move_main_key_holders(self, old_key, old_base)
         return self._replace_primary_openai_client(reason=reason)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
@@ -638,9 +662,11 @@ class ClientLifecycleMixin:
                 )
                 return False
         if self.api_mode == "anthropic_messages":
+            old_key, old_base = self.api_key, self.base_url
             self.api_key, self.base_url = api_key.strip(), base_url.strip().rstrip("/")
             self._anthropic_api_key, self._anthropic_base_url = self.api_key, self.base_url
             self._rebuild_anthropic_client()
+            _move_main_key_holders(self, old_key, old_base)
             return True
         # Nous requests should not inherit OpenRouter-only attribution headers.
         self._client_kwargs.pop("default_headers", None)
@@ -779,6 +805,7 @@ class ClientLifecycleMixin:
             self._client_kwargs.clear()
             self._client_kwargs.update(prior_client_kwargs)
             return False
+        _move_main_key_holders(self, prior_api_key, prior_base_url)
         # Rebind the pool entry id to the adopted key, or the next 429 quarantines the wrong credential.
         try:
             from agent.agent_runtime_helpers import sync_credential_pool_entry_id
@@ -807,10 +834,12 @@ class ClientLifecycleMixin:
         return ok
 
     def _apply_copilot_token(self, token: str, enterprise_base_url: Any, *, reason: str) -> bool:
+        old_key, old_base = self.api_key, self.base_url
         self.api_key = token
         if enterprise_base_url:
             self.base_url = enterprise_base_url.rstrip("/")
         self._sync_client_kwargs_credentials()
+        _move_main_key_holders(self, old_key, old_base)
         self._apply_client_headers_for_base_url(str(self.base_url or ""))
         return self._replace_primary_openai_client(reason=reason)
 
@@ -992,6 +1021,7 @@ class ClientLifecycleMixin:
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
         self._credential_pool_entry_id = getattr(entry, "id", None)
+        old_key, old_base = self.api_key, self.base_url
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)
         if self.api_mode == "anthropic_messages":
@@ -1001,8 +1031,10 @@ class ClientLifecycleMixin:
             self._anthropic_client = self._build_direct_anthropic_client(runtime_key, self._anthropic_base_url)
             self._is_anthropic_oauth = self._anthropic_oauth_flag(runtime_key)
             self.api_key, self.base_url = runtime_key, stripped_base
+            _move_main_key_holders(self, old_key, old_base)
             return True
         self.api_key, self.base_url = runtime_key, stripped_base
+        _move_main_key_holders(self, old_key, old_base)
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
